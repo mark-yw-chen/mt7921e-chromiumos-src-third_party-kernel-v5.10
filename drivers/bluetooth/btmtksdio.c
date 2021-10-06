@@ -74,7 +74,6 @@ MODULE_DEVICE_TABLE(sdio, btmtksdio_table);
 #define C_FW_OWN_REQ_CLR	BIT(9)
 
 #define MTK_REG_CSDIOCSR	0x8
-#define SDIO_RE_INIT_EN		BIT(0)
 #define SDIO_INT_CTL		BIT(2)
 
 #define MTK_REG_CHCR		0xc
@@ -86,7 +85,13 @@ MODULE_DEVICE_TABLE(sdio, btmtksdio_table);
 #define FW_OWN_BACK_INT		BIT(0)
 #define RX_DONE_INT		BIT(1)
 #define TX_EMPTY		BIT(2)
+#define TX_UNDER_THOLD		BIT(3)
+#define TX_COMPLETE_COUNT	BIT(4) | BIT(5) | BIT(6)
+#define FW_INT_IND_INDICATOR	BIT(7)
 #define TX_FIFO_OVERFLOW	BIT(8)
+#define FIRMWARE_INT		GENMASK(15, 9)
+#define FIRMWARE_INT_BIT15	BIT(15)
+#define FIRMWARE_INT_BIT31	BIT(31)
 #define RX_PKT_LEN		GENMASK(31, 16)
 
 #define MTK_REG_CTDR		0x18
@@ -451,7 +456,8 @@ static void btmtksdio_txrx_work(struct work_struct *work)
 
 	if (int_status & TX_EMPTY) {
 		atomic_set(&bdev->tx_ready, 1);
-		sdio_writel(bdev->func, TX_EMPTY, MTK_REG_CHISR, NULL);
+		sdio_writel(bdev->func, TX_EMPTY | TX_COMPLETE_COUNT,
+			    MTK_REG_CHISR, NULL);
 	} else if (unlikely(int_status & TX_FIFO_OVERFLOW)) {
 		sdio_writel(bdev->func, TX_FIFO_OVERFLOW, MTK_REG_CHISR, NULL);
 	}
@@ -518,15 +524,6 @@ static int btmtksdio_open(struct hci_dev *hdev)
 		goto err_disable_func;
 	}
 
-	/* Disable interrupt & mask out all interrupt sources */
-	sdio_writel(bdev->func, C_INT_EN_CLR, MTK_REG_CHLPCR, &err);
-	if (err < 0)
-		goto err_disable_func;
-
-	sdio_writel(bdev->func, 0, MTK_REG_CHIER, &err);
-	if (err < 0)
-		goto err_disable_func;
-
 	err = sdio_claim_irq(bdev->func, btmtksdio_interrupt);
 	if (err < 0)
 		goto err_disable_func;
@@ -538,8 +535,12 @@ static int btmtksdio_open(struct hci_dev *hdev)
 	/* SDIO CMD 5 allows the SDIO device back to idle state an
 	 * synchronous interrupt is supported in SDIO 4-bit mode
 	 */
-	sdio_writel(bdev->func, SDIO_INT_CTL | SDIO_RE_INIT_EN,
-		    MTK_REG_CSDIOCSR, &err);
+	val = sdio_readl(bdev->func, MTK_REG_CSDIOCSR, &err);
+	if (err < 0)
+		goto err_release_irq;
+
+	val |= SDIO_INT_CTL;
+	sdio_writel(bdev->func, val, MTK_REG_CSDIOCSR, &err);
 	if (err < 0)
 		goto err_release_irq;
 
@@ -548,13 +549,16 @@ static int btmtksdio_open(struct hci_dev *hdev)
 	if (err < 0)
 		goto err_release_irq;
 
-	val &= ~C_INT_CLR_CTRL;
+	val |= C_INT_CLR_CTRL;
 	sdio_writel(bdev->func, val, MTK_REG_CHCR, &err);
 	if (err < 0)
 		goto err_release_irq;
 
 	/* Setup interrupt sources */
-	sdio_writel(bdev->func, RX_DONE_INT | TX_EMPTY | TX_FIFO_OVERFLOW,
+	sdio_writel(bdev->func, FIRMWARE_INT_BIT31 |
+		    FIRMWARE_INT | TX_FIFO_OVERFLOW |
+		    FW_INT_IND_INDICATOR | TX_COMPLETE_COUNT |
+		    TX_UNDER_THOLD | TX_EMPTY | RX_DONE_INT,
 		    MTK_REG_CHIER, &err);
 	if (err < 0)
 		goto err_release_irq;
