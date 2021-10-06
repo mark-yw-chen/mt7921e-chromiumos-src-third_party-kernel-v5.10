@@ -87,14 +87,13 @@ MODULE_DEVICE_TABLE(sdio, btmtksdio_table);
 #define RX_DONE_INT		BIT(1)
 #define TX_EMPTY		BIT(2)
 #define TX_FIFO_OVERFLOW	BIT(8)
-#define INT_DEFAULT		(TX_FIFO_OVERFLOW | TX_EMPTY | RX_DONE_INT)
-#define RX_PKT_LEN		GENMASK(31, 16) /* only used in CONNAC */
+#define RX_PKT_LEN		GENMASK(31, 16)
 
 #define MTK_REG_CTDR		0x18
 
 #define MTK_REG_CRDR		0x1c
 
-#define MTK_REG_CRPLR		0x24 /* used in CONNAC2 */
+#define MTK_REG_CRPLR		0x24
 
 #define MTK_SDIO_BLOCK_SIZE	256
 
@@ -114,16 +113,12 @@ struct btmtksdio_dev {
 	struct work_struct txrx_work;
 	unsigned long tx_state;
 	struct sk_buff_head txq;
+	atomic_t tx_ready;
 
 	struct sk_buff *evt_skb;
 
 	const struct btmtksdio_data *data;
 };
-
-static inline bool is_mt7921(struct btmtksdio_dev *bdev)
-{
-	return bdev->data->chipid == 0x7921;
-}
 
 static int mtk_hci_wmt_sync(struct hci_dev *hdev,
 			    struct btmtk_hci_wmt_params *wmt_params)
@@ -259,6 +254,7 @@ static int btmtksdio_tx_packet(struct btmtksdio_dev *bdev,
 	sdio_hdr->reserved = cpu_to_le16(0);
 	sdio_hdr->bt_type = hci_skb_pkt_type(skb);
 
+	atomic_set(&bdev->tx_ready, 0);
 	err = sdio_writesb(bdev->func, MTK_REG_CTDR, skb->data,
 			   round_up(skb->len, MTK_SDIO_BLOCK_SIZE));
 	if (err < 0)
@@ -437,8 +433,9 @@ static void btmtksdio_txrx_work(struct work_struct *work)
 						  txrx_work);
 	struct sk_buff *skb;
 	int err, count = 0;
-	u32 int_status, rx_size;
-	bool tx_empty;
+	u32 int_status;
+	u16 rx_size = 0;
+	u32 rx_pkt_len;
 
 	pm_runtime_get_sync(bdev->dev);
 
@@ -447,48 +444,35 @@ static void btmtksdio_txrx_work(struct work_struct *work)
 	/* Disable interrupt */
 	sdio_writel(bdev->func, C_INT_EN_CLR, MTK_REG_CHLPCR, 0);
 
-poll_again:
-	tx_empty = false;
+	int_status = sdio_readl(bdev->func, MTK_REG_CHISR, NULL);
 
-	while ((skb = skb_dequeue(&bdev->txq))) {
-		err = btmtksdio_tx_packet(bdev, skb);
-		if (err < 0) {
-			bdev->hdev->stat.err_tx++;
-			skb_queue_head(&bdev->txq, skb);
-			break;
+	if (int_status & FW_OWN_BACK_INT)
+		sdio_writel(bdev->func, FW_OWN_BACK_INT, MTK_REG_CHISR, NULL);
+
+	if (int_status & TX_EMPTY) {
+		atomic_set(&bdev->tx_ready, 1);
+		sdio_writel(bdev->func, TX_EMPTY, MTK_REG_CHISR, NULL);
+	} else if (unlikely(int_status & TX_FIFO_OVERFLOW)) {
+		sdio_writel(bdev->func, TX_FIFO_OVERFLOW, MTK_REG_CHISR, NULL);
+	}
+
+	if (atomic_read(&bdev->tx_ready)) {
+		skb = skb_dequeue(&bdev->txq);
+		if (skb) {
+			err = btmtksdio_tx_packet(bdev, skb);
+			if (err < 0) {
+				bdev->hdev->stat.err_tx++;
+				skb_queue_head(&bdev->txq, skb);
+			}
 		}
 	}
 
-	do {
-		int_status = sdio_readl(bdev->func, MTK_REG_CHISR, NULL);
-		rx_size = (int_status & RX_PKT_LEN) >> 16;
-		int_status &= INT_DEFAULT;
-
-		if (int_status)
-			count = 0;
-
-		if (int_status & FW_OWN_BACK_INT)
-			bt_dev_dbg(bdev->hdev, "Get fw own back");
-
-		if (int_status & TX_EMPTY)
-			tx_empty = true;
-		else if (unlikely(int_status & TX_FIFO_OVERFLOW))
-			bt_dev_warn(bdev->hdev, "Tx fifo overflow");
-
-		if (int_status & RX_DONE_INT) {
-			if (is_mt7921(bdev)) {
-				rx_size = sdio_readl(bdev->func, MTK_REG_CRPLR, NULL);
-				rx_size = (rx_size & RX_PKT_LEN) >> 16;
-			}
-
-			if (btmtksdio_rx_packet(bdev, rx_size) < 0)
-				bdev->hdev->stat.err_rx++;
-		}
-	} while (int_status);
-
-	if (tx_empty || count < 4) {
-		count++;
-		goto poll_again;
+	if (int_status & RX_DONE_INT) {
+		rx_pkt_len = sdio_readl(bdev->func, MTK_REG_CRPLR, NULL);
+		rx_size = (rx_pkt_len & RX_PKT_LEN) >> 16;
+		sdio_writel(bdev->func, int_status, MTK_REG_CHISR, NULL);
+		if (btmtksdio_rx_packet(bdev, rx_size) < 0)
+			bdev->hdev->stat.err_rx++;
 	}
 
 	/* Enable interrupt */
@@ -803,6 +787,7 @@ static int btmtksdio_setup(struct hci_dev *hdev)
 	u32 fw_version = 0;
 
 	calltime = ktime_get();
+	atomic_set(&bdev->tx_ready, 1);
 
 	switch (bdev->data->chipid) {
 	case 0x7921:
