@@ -113,6 +113,7 @@ struct btmtksdio_dev {
 	struct work_struct txrx_work;
 	unsigned long tx_state;
 	struct sk_buff_head txq;
+	atomic_t hw_tx_ready;
 
 	struct sk_buff *evt_skb;
 
@@ -253,6 +254,7 @@ static int btmtksdio_tx_packet(struct btmtksdio_dev *bdev,
 	sdio_hdr->reserved = cpu_to_le16(0);
 	sdio_hdr->bt_type = hci_skb_pkt_type(skb);
 
+	atomic_set(&bdev->hw_tx_ready, 0);
 	err = sdio_writesb(bdev->func, MTK_REG_CTDR, skb->data,
 			   round_up(skb->len, MTK_SDIO_BLOCK_SIZE));
 	if (err < 0)
@@ -440,15 +442,6 @@ static void btmtksdio_txrx_work(struct work_struct *work)
 	/* Disable interrupt */
 	sdio_writel(bdev->func, C_INT_EN_CLR, MTK_REG_CHLPCR, 0);
 
-	while ((skb = skb_dequeue(&bdev->txq))) {
-		err = btmtksdio_tx_packet(bdev, skb);
-		if (err < 0) {
-			bdev->hdev->stat.err_tx++;
-			skb_queue_head(&bdev->txq, skb);
-			break;
-		}
-	}
-
 	int_status = sdio_readl(bdev->func, MTK_REG_CHISR, NULL);
 
 	/* Ack an interrupt as soon as possible before any operation on
@@ -466,9 +459,20 @@ static void btmtksdio_txrx_work(struct work_struct *work)
 		bt_dev_dbg(bdev->hdev, "Get fw own back");
 
 	if (int_status & TX_EMPTY)
-		schedule_work(&bdev->txrx_work);
+		atomic_set(&bdev->hw_tx_ready, 1);
 	else if (unlikely(int_status & TX_FIFO_OVERFLOW))
 		bt_dev_warn(bdev->hdev, "Tx fifo overflow");
+
+	if (atomic_read(&bdev->hw_tx_ready)) {
+		skb = skb_dequeue(&bdev->txq);
+		if (skb) {
+			err = btmtksdio_tx_packet(bdev, skb);
+			if (err < 0) {
+				bdev->hdev->stat.err_tx++;
+				skb_queue_head(&bdev->txq, skb);
+			}
+		}
+	}
 
 	if (int_status & RX_DONE_INT) {
 		rx_size = sdio_readl(bdev->func, MTK_REG_CRPLR, NULL);
@@ -793,6 +797,7 @@ static int btmtksdio_setup(struct hci_dev *hdev)
 	u32 fw_version = 0;
 
 	calltime = ktime_get();
+	atomic_set(&bdev->hw_tx_ready, 1);
 
 	switch (bdev->data->chipid) {
 	case 0x7921:
